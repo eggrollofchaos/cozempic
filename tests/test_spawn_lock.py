@@ -729,6 +729,43 @@ class TestSymlinkDefense(unittest.TestCase):
                 pass
         self.assertEqual(self.victim.read_text(encoding="utf-8"), "ORIGINAL\n")
 
+    def test_reclaim_lock_rejects_non_regular_file(self):
+        """A planted FIFO must not become the reclaim lock."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("platform has no mkfifo")
+        from cozempic.spawn_lock import _stale_reclaim_lock
+
+        lock_path = self.pid_path.with_name(f"{self.pid_path.name}.reclaim-lock")
+        os.mkfifo(lock_path)
+        with self.assertRaises(OSError):
+            with _stale_reclaim_lock(self.pid_path):
+                pass
+
+    def test_reclaim_lock_contention_is_bounded(self):
+        """A held reclaim lock fails closed instead of blocking startup."""
+        if os.name == "nt":
+            self.skipTest("POSIX flock test")
+        import fcntl
+
+        from cozempic.spawn_lock import (
+            DaemonAlreadyStarting,
+            _RECLAIM_LOCK_ATTEMPTS,
+            _stale_reclaim_lock,
+        )
+
+        lock_path = self.pid_path.with_name(f"{self.pid_path.name}.reclaim-lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with patch("cozempic.spawn_lock.time.sleep") as sleep:
+                with self.assertRaises(DaemonAlreadyStarting):
+                    with _stale_reclaim_lock(self.pid_path, session_id="held-lock"):
+                        pass
+            self.assertEqual(sleep.call_count, _RECLAIM_LOCK_ATTEMPTS - 1)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
     def test_log_write_rejects_symlink(self):
         """The deterministic guard log path must not follow a symlink."""
         if not hasattr(os, "O_NOFOLLOW"):

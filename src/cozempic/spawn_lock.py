@@ -65,6 +65,7 @@ because the loser shape is just the exception).
 
 from __future__ import annotations
 
+import errno
 import math
 import os
 import re
@@ -102,6 +103,8 @@ from typing import Iterator
 # the active value can read ``spawn_lock._FRESH_PIDFILE_SECONDS``.
 _DEFAULT_FRESH = 5.0
 _FRESH_MAX = 300.0
+_RECLAIM_LOCK_ATTEMPTS = 5
+_RECLAIM_LOCK_RETRY_SECONDS = 0.01
 
 
 def _read_fresh_window_seconds() -> float:
@@ -291,26 +294,46 @@ class DaemonAlreadyStarting(Exception):
 
 
 @contextmanager
-def _stale_reclaim_lock(pid_file: Path) -> Iterator[None]:
+def _stale_reclaim_lock(pid_file: Path, session_id: str = "") -> Iterator[None]:
     """Serialize stale-claim replacement without unlinking the lock path."""
     lock_path = pid_file.with_name(f"{pid_file.name}.reclaim-lock")
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     fd = os.open(str(lock_path), flags, 0o600)
     locked = False
     try:
-        if os.name == "nt":
-            import msvcrt
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, f"reclaim lock is not a regular file: {lock_path}")
 
-            os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
+        def try_lock() -> None:
+            if os.name == "nt":
+                import msvcrt
 
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        locked = True
+                os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        lock_error: OSError | None = None
+        for attempt in range(_RECLAIM_LOCK_ATTEMPTS):
+            try:
+                try_lock()
+                locked = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+                lock_error = exc
+                if attempt + 1 < _RECLAIM_LOCK_ATTEMPTS:
+                    time.sleep(_RECLAIM_LOCK_RETRY_SECONDS)
+        if not locked:
+            raise DaemonAlreadyStarting(session_id or str(pid_file)) from lock_error
         yield
     finally:
         if locked:
@@ -406,7 +429,7 @@ class DaemonSpawnClaim:
             # A persistent companion lock serializes the stale inspection and
             # replacement. Unlike the old flock sentinel, this lock path is
             # never unlinked, so every contender locks the same inode.
-            with _stale_reclaim_lock(self.pid_file):
+            with _stale_reclaim_lock(self.pid_file, session_id=self.session_id):
                 try:
                     fd = os.open(str(self.pid_file), flags, 0o600)
                 except FileExistsError:
