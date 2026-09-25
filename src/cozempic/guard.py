@@ -2208,6 +2208,46 @@ def _wait_for_exit(pid: int, timeout: float = 5.0) -> bool:
     return False
 
 
+def _tmux_pane_owns_process(pane: str, pid: int) -> bool:
+    """Return whether the named pane still contains the target process."""
+    if not pane.startswith("%") or not pane[1:].isdigit():
+        return False
+
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        pane_pid = int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+    current_pid = pid
+    seen: set[int] = set()
+    for _ in range(64):
+        if current_pid == pane_pid:
+            return True
+        if current_pid <= 1 or current_pid in seen:
+            return False
+        seen.add(current_pid)
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(current_pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+            parent_pid = int(result.stdout.strip())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
+        if parent_pid == current_pid:
+            return False
+        current_pid = parent_pid
+    return False
+
+
 def _terminate_and_resume(
     claude_pid: int,
     project_dir: str,
@@ -2292,6 +2332,13 @@ def _terminate_and_resume(
         if not _is_claude_process(claude_pid, session_path=session_path):
             print(f"  WARNING: PID {claude_pid} is no longer a Claude process — skipping tmux terminate+resume.")
             return
+        pane = os.environ.get("TMUX_PANE", "")
+        if not _tmux_pane_owns_process(pane, claude_pid):
+            print(
+                "  tmux pane is missing or no longer owns this Claude process — "
+                f"skipping auto-resume. Resume manually: {resume_cmd}"
+            )
+            return
         # PID check passed — we ARE going to terminate + auto-resume. Write the
         # sentinel BEFORE send-keys so the resumed Claude's SessionStart hook
         # sees it and skips the daemon spawn during the resume window.
@@ -2300,13 +2347,11 @@ def _terminate_and_resume(
                 write_reload_sentinel(session_id, claude_pid)
             except OSError:
                 pass  # best-effort; stale-GC clears any leaked sentinel
-        pane = os.environ.get("TMUX_PANE", "")
-        target = f"-t {pane}" if pane else ""
         print(f"  tmux detected — sending /exit and auto-resuming in same pane...")
 
         # Send /exit to Claude
         subprocess.run(
-            ["tmux", "send-keys", *(["-t", pane] if pane else []), "/exit", "Enter"],
+            ["tmux", "send-keys", "-t", pane, "/exit", "Enter"],
             capture_output=True, timeout=5,
         )
 
@@ -2327,7 +2372,7 @@ def _terminate_and_resume(
 
         # Resume in same pane
         subprocess.run(
-            ["tmux", "send-keys", *(["-t", pane] if pane else []),
+            ["tmux", "send-keys", "-t", pane,
              f"cd {shell_quote(project_dir)} && {resume_cmd}", "Enter"],
             capture_output=True, timeout=5,
         )

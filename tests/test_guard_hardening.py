@@ -491,6 +491,76 @@ class TestG5_TerminateAndResumeReVerifiesClaudePid(unittest.TestCase):
                 "tmux-path _terminate_and_resume SIGTERM'd a recycled (non-Claude) PID",
             )
 
+    def test_tmux_reload_skips_when_pane_does_not_own_claude(self):
+        """A missing or reused TMUX_PANE must never target the active pane."""
+        from cozempic.guard import _terminate_and_resume
+
+        parents = {54321: 100, 100: 1}
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["tmux", "display-message", "-p"]:
+                return subprocess.CompletedProcess(args, 0, stdout="999\n", stderr="")
+            if args[:3] == ["ps", "-o", "ppid="]:
+                parent_pid = parents.get(int(args[-1]))
+                if parent_pid is None:
+                    return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+                return subprocess.CompletedProcess(args, 0, stdout=f"{parent_pid}\n", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with (
+            patch.dict(os.environ, {"TMUX_PANE": "%7"}),
+            patch("cozempic.guard._detect_terminal_env", return_value="tmux"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard._pid_is_alive", return_value=True),
+            patch("cozempic.guard._pid_identity_match", return_value=True),
+            patch("cozempic.guard._is_claude_process", return_value=True),
+            patch("cozempic.guard.subprocess.run", side_effect=fake_run) as mock_run,
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard.write_reload_sentinel") as mock_sentinel,
+        ):
+            _terminate_and_resume(54321, "/tmp/proj", session_id="sess-tmux")
+
+        self.assertFalse(
+            any(call.args[0][:2] == ["tmux", "send-keys"] for call in mock_run.call_args_list)
+        )
+        mock_kill.assert_not_called()
+        mock_sentinel.assert_not_called()
+
+    def test_tmux_pane_owns_claude_when_pid_is_in_pane_process_tree(self):
+        from cozempic.guard import _tmux_pane_owns_process
+
+        parents = {54321: 100, 100: 999}
+
+        def fake_run(args, **kwargs):
+            if args[:3] == ["tmux", "display-message", "-p"]:
+                return subprocess.CompletedProcess(args, 0, stdout="999\n", stderr="")
+            parent_pid = parents.get(int(args[-1]))
+            return subprocess.CompletedProcess(args, 0, stdout=f"{parent_pid}\n", stderr="")
+
+        with patch("cozempic.guard.subprocess.run", side_effect=fake_run):
+            self.assertTrue(_tmux_pane_owns_process("%7", 54321))
+
+    def test_tmux_reload_skips_when_pane_is_missing(self):
+        """TMUX without TMUX_PANE cannot safely identify a destination."""
+        from cozempic.guard import _terminate_and_resume
+
+        with (
+            patch.dict(os.environ, {"TMUX_PANE": ""}),
+            patch("cozempic.guard._detect_terminal_env", return_value="tmux"),
+            patch("cozempic.guard._detect_claude_flags", return_value=""),
+            patch("cozempic.guard._pid_is_alive", return_value=True),
+            patch("cozempic.guard._pid_identity_match", return_value=True),
+            patch("cozempic.guard._is_claude_process", return_value=True),
+            patch("cozempic.guard.subprocess.run") as mock_run,
+            patch("cozempic.guard.os.kill") as mock_kill,
+            patch("cozempic.guard.write_reload_sentinel") as mock_sentinel,
+        ):
+            _terminate_and_resume(54321, "/tmp/proj", session_id="sess-tmux")
+
+        mock_run.assert_not_called()
+        mock_kill.assert_not_called()
+        mock_sentinel.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # BUG-G6 — Windows cmd must quote project_dir; injection must not execute
